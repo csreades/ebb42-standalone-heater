@@ -1,0 +1,6 @@
+[submodule "vendor/tinyusb"]
+	path = vendor/tinyusb
+	url = https://github.com/hathach/tinyusb
+[submodule "vendor/cmsis_device_g0"]
+	path = vendor/cmsis_device_g0
+	url = https://github.com/STMicroelectronics/cmsis_device_g0
