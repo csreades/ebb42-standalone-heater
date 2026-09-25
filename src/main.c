@@ -67,6 +67,12 @@
 #define VERIFY_HYST_C        5.0f     /* Klipper verify_heater: hysteresis */
 #define VERIFY_GAIN_C        1.5f     /* must rise this much ...           */
 #define VERIFY_TIME_MS       45000u   /* ... within this time              */
+#define VERIFY_MAX_ERROR     120.0f   /* Klipper max_error, degC*s below target-hyst */
+#define CONTROL_TIMEOUT_MS   1000u    /* SysTick forces heater off if the control
+                                         loop stops updating (Klipper max_duration) */
+#define ADC_RANGE_MIN        5.0f     /* raw ADC sanity window, Klipper adc_range */
+#define ADC_RANGE_MAX        4090.0f
+#define ADC_RANGE_COUNT      4u       /* consecutive out-of-range samples -> fault */
 
 /* Timing */
 #define SAMPLE_PERIOD_MS     10u
@@ -83,6 +89,7 @@
 static volatile uint32_t g_ms;              /* SysTick millisecond counter */
 static volatile uint8_t  g_heater_duty;     /* 0..PWM_WINDOW_MS            */
 static volatile bool     g_fault_latched;
+static volatile uint32_t g_control_stamp;   /* millis() of last control update */
 
 static float       g_target = DEFAULT_TARGET_C;
 static bool        g_enabled = true;
@@ -125,8 +132,8 @@ void SysTick_Handler(void)
 {
     uint32_t now = ++g_ms;
     if ((now % g_led_period) < g_led_on) LED_ON(); else LED_OFF();
-    if (g_fault_latched) {
-        HEATER_OFF();
+    if (g_fault_latched || (now - g_control_stamp) > CONTROL_TIMEOUT_MS) {
+        HEATER_OFF();               /* latched fault, or control loop stalled */
         return;
     }
     if ((now % PWM_WINDOW_MS) < g_heater_duty)
@@ -474,34 +481,68 @@ static float control_update(float temp, float dt)
 }
 #endif
 
-/* Klipper-style verify_heater: while below target, the temperature must
- * keep rising by VERIFY_GAIN_C every VERIFY_TIME_MS or we declare a fault
- * (heater unplugged, thermistor fell off, MOSFET dead, no 24 V ...).   */
-static bool     vh_approaching;
-static float    vh_goal_temp;
+/* Klipper verify_heater (klippy/extras/verify_heater.py), same algorithm:
+ *  - while approaching the target the temperature must rise VERIFY_GAIN_C
+ *    every VERIFY_TIME_MS, otherwise "not heating at expected rate";
+ *  - once at temperature, time spent more than VERIFY_HYST_C below target
+ *    accumulates as degC*s; above VERIFY_MAX_ERROR -> "not maintaining".
+ * Catches an unplugged heater, dead MOSFET, missing 24 V, and a thermistor
+ * that has fallen off the heated part.                                   */
+static bool     vh_approaching, vh_starting;
+static float    vh_goal_temp, vh_error, vh_last_target = -1000.0f;
 static uint32_t vh_goal_time;
 
-static void verify_reset(void) { vh_approaching = false; }
-
-static void verify_heater(float temp, uint32_t now)
+static void verify_reset(void)
 {
-    if (temp >= g_target - VERIFY_HYST_C) {
-        vh_approaching = false;
+    vh_approaching = vh_starting = false;
+    vh_error = 0.0f;
+    vh_last_target = -1000.0f;              /* forces a fresh approach check */
+}
+
+static void verify_heater(float temp, uint32_t now, float dt)
+{
+    float target = g_target;
+    if (temp >= target - VERIFY_HYST_C) {
+        vh_approaching = vh_starting = false;
+        if (temp <= target + VERIFY_HYST_C) vh_error = 0.0f;
+        vh_last_target = target;
         return;
     }
+    vh_error += ((target - VERIFY_HYST_C) - temp) * dt;
     if (!vh_approaching) {
-        vh_approaching = true;
+        if (target != vh_last_target) {
+            vh_approaching = vh_starting = true;
+            vh_goal_temp = temp + VERIFY_GAIN_C;
+            vh_goal_time = now + VERIFY_TIME_MS;
+        } else if (vh_error >= VERIFY_MAX_ERROR) {
+            fault("FAULT_HEATER_NOT_MAINTAINING_TEMP", "TEMP DROPPED");
+        }
+    } else if (temp >= vh_goal_temp) {
+        vh_starting = false;
+        vh_error = 0.0f;
         vh_goal_temp = temp + VERIFY_GAIN_C;
         vh_goal_time = now + VERIFY_TIME_MS;
-        return;
-    }
-    if (temp >= vh_goal_temp) {
-        vh_goal_temp = temp + VERIFY_GAIN_C;
-        vh_goal_time = now + VERIFY_TIME_MS;
-        return;
-    }
-    if ((int32_t)(now - vh_goal_time) >= 0)
+    } else if ((int32_t)(now - vh_goal_time) >= 0) {
         fault("FAULT_HEATER_NOT_HEATING", "NOT HEATING");
+    } else if (vh_starting) {
+        if (temp + VERIFY_GAIN_C < vh_goal_temp) vh_goal_temp = temp + VERIFY_GAIN_C;
+    }
+    vh_last_target = target;
+}
+
+/* Klipper adc_range: raw sample must stay inside the window, a few
+ * consecutive misses is a sensor fault regardless of the filtered value.  */
+static uint32_t adc_range_misses;
+
+static void check_adc_range(float raw)
+{
+    if (raw <= ADC_RANGE_MIN || raw >= ADC_RANGE_MAX) {
+        if (++adc_range_misses >= ADC_RANGE_COUNT)
+            fault(raw >= ADC_RANGE_MAX ? "FAULT_ADC_OPEN" : "FAULT_ADC_SHORT",
+                  raw >= ADC_RANGE_MAX ? "SENSOR OPEN" : "SENSOR SHORT");
+    } else {
+        adc_range_misses = 0;
+    }
 }
 
 static void check_limits(float temp)
@@ -577,6 +618,7 @@ int main(void)
         if ((now - last_sample) >= SAMPLE_PERIOD_MS) {
             last_sample += SAMPLE_PERIOD_MS;
             g_adc_raw = adc_read_avg();
+            check_adc_range(g_adc_raw);
             temp_filt += 0.25f * (adc_to_temp(g_adc_raw) - temp_filt);
             g_temp = temp_filt;
             check_limits(temp_filt);
@@ -590,9 +632,10 @@ int main(void)
         if ((now - last_control) >= CONTROL_PERIOD_MS) {
             float dt = (float)(now - last_control) / 1000.0f;
             last_control = now;
+            g_control_stamp = now;              /* keeps SysTick's heater gate open */
             if (g_enabled) {
                 set_heater_power(control_update(temp_filt, dt));
-                verify_heater(temp_filt, now);
+                verify_heater(temp_filt, now, dt);
                 if (temp_filt >= g_target - VERIFY_HYST_C) {
                     g_state = "AT_TEMP";
                     led_pattern_at_temp();

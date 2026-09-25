@@ -25,14 +25,29 @@ flashing.
 * PID control (Klipper-style gains, output on 0..255 scale), 250 ms loop,
   100 ms time-proportioning window on the heater pin.
   Set `CONTROL_MODE_PID 0` for simple bang-bang with ±1 °C hysteresis.
-* Safety, all of which latch the heater **off until power cycle**:
-  * temperature below 0 °C (open thermistor) or above 130 °C (short)
-  * more than 25 °C above target
-  * "verify heater": while below target, temperature must rise 1.5 °C every
-    45 s, otherwise the heater is assumed disconnected / thermistor fallen off
-  * independent watchdog (2 s)
+* Safety: the same checks Klipper applies to a toolhead heater, all of which
+  latch the heater **off until reset / power cycle** (see table below).
 * Heater is held low from the first instruction and stays off for 1 s at
   boot while the ADC filter settles.
+
+## Protection, compared with Klipper
+
+| Klipper check                          | Here                                                                 |
+|----------------------------------------|----------------------------------------------------------------------|
+| `min_temp` / `max_temp`                | 0 °C / 130 °C on the filtered reading (`MIN_TEMP_C`, `MAX_TEMP_C`)   |
+| MCU `adc_range` (raw sample window, 4 consecutive misses) | same: raw 5..4090 counts, 4 misses -> `FAULT_ADC_OPEN/SHORT` |
+| `verify_heater` heating gain           | must rise `VERIFY_GAIN_C` (1.5 °C) every `VERIFY_TIME_MS` (45 s)      |
+| `verify_heater` `max_error`            | 120 °C·s below target-5 °C while at temp -> `FAULT_HEATER_NOT_MAINTAINING_TEMP` |
+| `verify_heater` `hysteresis`           | 5 °C                                                                 |
+| overshoot                              | target + 25 °C -> fault (Klipper relies on `max_temp` for this)      |
+| heater `max_duration` (MCU turns PWM off if host stops refreshing) | SysTick forces the pin low if the control loop has not run for 1 s |
+| MCU watchdog                           | independent watchdog, 2 s                                            |
+| heater off at boot / on shutdown       | pin driven low before it becomes an output; gate has a 20k pull-down; PWM window only opens after the first control update |
+| `max_power`                            | `MAX_POWER`                                                          |
+
+Klipper's hotend defaults are 2 °C gain in 20 s; this firmware ships looser
+(1.5 °C in 45 s) because the heater is unknown. Tighten `VERIFY_*` once you
+know how fast yours responds.
 
 ## USB telemetry
 
