@@ -2,8 +2,10 @@
 
 Bare-metal firmware that turns a BIGTREETECH EBB42 CAN v1.2 toolhead board
 into a self-contained temperature controller: it holds the thermistor at a
-fixed setpoint (default 80 °C) with no host, no CAN, and no USB needed after
-flashing.
+fixed 80 °C with no host, no CAN, and no USB needed after
+flashing. The setpoint is hard-coded and the heater is always enabled:
+there are no buttons, no setpoint commands, and nothing is stored in flash.
+To change the temperature, edit `TARGET_C` in `src/main.c` and reflash.
 
 ## Hardware assumptions
 
@@ -59,19 +61,17 @@ line per second:
 t=21s temp=20.66C raw=3942 duty=100% target=80.0 en=1 oled=0 state=HEATING
 ```
 
-`state` is `STARTUP`, `HEATING`, `AT_TEMP`, `STANDBY` or a `FAULT_*` reason.
+`state` is `STARTUP`, `HEATING`, `AT_TEMP` or a `FAULT_*` reason.
 Run `./monitor.sh` to watch it. Single-character commands:
 
 | Key | Action                                              |
 |-----|-----------------------------------------------------|
-| `+` / `-` | setpoint up / down 1 °C                       |
-| `e` | toggle heater on/off                                |
 | `r` | reset the MCU (clears a latched fault)              |
 | `b` | reboot into the ROM DFU bootloader (used by flash.sh) |
 
-To send one: `printf 'e' > /dev/ttyACM0`.
+To send one: `printf 'r' > /dev/ttyACM0`.
 
-## Optional OLED and buttons
+## Optional OLED
 
 Any 128x64 SSD1306 I2C module (0.96", address 0x3C) plugs into the **I2C**
 header; set `-DOLED_SH1106=1` in the Makefile for 1.3" SH1106 modules. The
@@ -87,20 +87,7 @@ firmware probes for the display every 2 s, so it works with or without one.
 PB3/PB4 are 5 V tolerant ("FT") pins, so a 5 V-powered module with its
 pull-ups to 5 V is fine. Check your module's pin order; many are GND-VCC-SCL-SDA.
 
-Three momentary buttons to GND on the **Endstop** header give local control
-(the board already has 10k pull-ups and 1k series resistors on these):
-
-| Endstop header pin | Signal | MCU pin | Function                              |
-|--------------------|--------|---------|---------------------------------------|
-| 3                  | Stop1  | PB5     | setpoint up (hold to repeat)          |
-| 2                  | Stop2  | PB6     | setpoint down (hold to repeat)        |
-| 1                  | Stop3  | PB7     | heater on/off; when faulted: reset    |
-| 4                  | GND    | -       | common for all three                  |
-
-Setpoint range is 20..100 °C in 1 °C steps. Setpoint and on/off state are
-saved to the last flash page 3 s after the last change and restored at boot.
-
-Screen layout: setpoint and status on the top line, temperature large in the
+Screen layout: target and status on the top line, temperature large in the
 middle, heater power bar at the bottom. A fault shows `FAULT` with the reason.
 
 ## Status LED
@@ -113,7 +100,6 @@ the board is readable without USB:
 | slow blink (1 s period)  | heating, more than 5 °C below target     |
 | solid on                 | at temperature                           |
 | fast blink (5 Hz)        | fault latched, heater off; reset to clear|
-| short blip every 2 s     | heater disabled (standby)                |
 
 The green LED next to the regulator is a plain 3.3 V power indicator.
 Using PA13 as a GPIO disables SWD debugging; DFU flashing is unaffected.
@@ -139,7 +125,8 @@ make            # -> build/ebb42_heater.bin / .hex / .elf
 ```
 
 If the board is already running this firmware, `flash.sh` sends it the `b`
-command so it drops into DFU by itself; no buttons needed. `flash.sh` writes
+command so it drops into DFU by itself; no buttons needed. (On some boards
+the jump to the ROM bootloader doesn't take; then use BOOT + RESET.) `flash.sh` writes
 to 0x08000000 and issues `:leave`, so the board resets straight into the new
 firmware. This overwrites whatever was there before (Klipper / Katapult). To
 go back, re-enter DFU mode and flash that image.
@@ -151,8 +138,7 @@ for 0483:df11) are installed on this machine, so no sudo is needed.
 
 Everything user-facing is at the top of `src/main.c`:
 
-* `DEFAULT_TARGET_C` – setpoint used until one is saved from the buttons/USB
-* `SETPOINT_MIN_C` / `SETPOINT_MAX_C` – adjustment range
+* `TARGET_C` – the fixed setpoint
 * `PID_KP / PID_KI / PID_KD` – if the heater is much bigger or smaller than a
   ~40 W hotend cartridge you may want to retune, or just switch to bang-bang
 * `MAX_POWER` – cap the duty cycle (e.g. 0.5 for a heater that is

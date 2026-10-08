@@ -8,14 +8,12 @@
  *         (Klipper: sensor_pin PA3, sensor_type EPCOS 100K B57560G104F)
  * LED   : PA13  -> blue "Status" LED via 200R to GND, active high.
  *         PA13 is also SWDIO; using it as a GPIO disables SWD (DFU still works).
- *         Slow blink = heating, solid = at temperature, fast blink = fault,
- *         short blip every 2 s = heater disabled (standby).
+ *         Slow blink = heating, solid = at temperature, fast blink = fault.
  * OLED  : optional 128x64 SSD1306 on the I2C header (PB3 SCL, PB4 SDA).
- * Keys  : optional buttons to GND on the Endstop header:
- *         Stop1/PB5 = setpoint up, Stop2/PB6 = setpoint down,
- *         Stop3/PB7 = heater on/off, or reset when faulted.
- * USB   : CDC serial telemetry once a second. Commands: '+'/'-' setpoint,
- *         'e' toggle heater, 'r' reset, 'b' reboot to DFU bootloader.
+ * Setpoint is fixed at TARGET_C and the heater is always enabled; there
+ * are no buttons and nothing is stored in flash. Change TARGET_C and reflash.
+ * USB   : CDC serial telemetry once a second. Commands: 'r' reset (clears a
+ *         latched fault), 'b' reboot to DFU bootloader.
  *
  * Safety (all latch the heater OFF until reset / power cycle):
  *   - min/max temperature sanity (open / shorted thermistor)
@@ -32,15 +30,11 @@
 #include "usb.h"
 #include "oled.h"
 #include "ui.h"
-#include "settings.h"
 
 /* ------------------------------------------------------------------ */
 /* User configuration                                                  */
 /* ------------------------------------------------------------------ */
-#define DEFAULT_TARGET_C     80.0f
-#define SETPOINT_MIN_C       20.0f
-#define SETPOINT_MAX_C       100.0f
-#define SETPOINT_STEP_C      1.0f
+#define TARGET_C             80.0f
 #define CONTROL_MODE_PID     1        /* 1 = PID, 0 = bang-bang            */
 #define MAX_POWER            1.0f     /* 0.0 .. 1.0 cap on heater duty     */
 #define BANGBANG_HYST_C      1.0f
@@ -80,7 +74,6 @@
 #define UI_PERIOD_MS         250u
 #define PWM_WINDOW_MS        100u     /* heater time-proportioning window  */
 #define STARTUP_SETTLE_MS    1000u
-#define SETTINGS_SAVE_DELAY_MS 3000u
 #define ADC_OVERSAMPLE       16u
 
 /* ------------------------------------------------------------------ */
@@ -91,20 +84,15 @@ static volatile uint8_t  g_heater_duty;     /* 0..PWM_WINDOW_MS            */
 static volatile bool     g_fault_latched;
 static volatile uint32_t g_control_stamp;   /* millis() of last control update */
 
-static float       g_target = DEFAULT_TARGET_C;
-static bool        g_enabled = true;
+static const float g_target = TARGET_C;
 static float       g_temp;                  /* filtered temperature        */
 static float       g_adc_raw;
 static const char *g_state = "STARTUP";
 static const char *g_fault_short = "";      /* short text for the OLED     */
-static uint32_t    g_settings_dirty_at;
-static bool        g_settings_dirty;
 
 static float adc_to_temp(float adc);
 static float adc_read_avg(void);
 static void  ui_update(void);
-static void  control_reset(void);
-static void  verify_reset(void);
 
 /* ------------------------------------------------------------------ */
 /* Pins                                                                */
@@ -117,16 +105,11 @@ static void  verify_reset(void);
 #define LED_ON()        (GPIOA->BSRR = (1u << LED_PIN))
 #define LED_OFF()       (GPIOA->BRR  = (1u << LED_PIN))
 
-#define BTN_UP_PIN      5u                       /* PB5, Endstop1 */
-#define BTN_DOWN_PIN    6u                       /* PB6, Endstop2 */
-#define BTN_OK_PIN      7u                       /* PB7, Endstop3 */
-
 /* LED pattern: period in ms and on-time in ms, driven from SysTick */
 static volatile uint16_t g_led_period = 1000, g_led_on = 500;
 static void led_pattern_heating(void) { g_led_period = 1000; g_led_on = 500; }
 static void led_pattern_at_temp(void) { g_led_period = 1000; g_led_on = 1000; }
 static void led_pattern_fault(void)   { g_led_period = 200;  g_led_on = 100; }
-static void led_pattern_standby(void) { g_led_period = 2000; g_led_on = 60; }
 
 void SysTick_Handler(void)
 {
@@ -158,81 +141,6 @@ static void set_heater_power(float power)   /* 0.0 .. 1.0 */
 }
 
 /* ------------------------------------------------------------------ */
-/* Buttons (active low, debounced, auto-repeat)                        */
-/* ------------------------------------------------------------------ */
-typedef struct {
-    uint8_t  pin;
-    uint8_t  cnt;
-    bool     stable;
-    uint32_t next_rep;
-} btn_t;
-
-static btn_t btn_up = { .pin = BTN_UP_PIN }, btn_down = { .pin = BTN_DOWN_PIN }, btn_ok = { .pin = BTN_OK_PIN };
-
-enum { BTN_NONE = 0, BTN_CLICK, BTN_REPEAT };
-
-/* call every SAMPLE_PERIOD_MS */
-static int btn_update(btn_t *b, uint32_t now)
-{
-    bool pressed = !((GPIOB->IDR >> b->pin) & 1u);
-    if (pressed == b->stable) {
-        b->cnt = 0;
-    } else if (++b->cnt >= 3) {
-        b->cnt = 0;
-        b->stable = pressed;
-        if (pressed) {
-            b->next_rep = now + 600;
-            return BTN_CLICK;
-        }
-    }
-    if (b->stable && (int32_t)(now - b->next_rep) >= 0) {
-        b->next_rep = now + 120;
-        return BTN_REPEAT;
-    }
-    return BTN_NONE;
-}
-
-/* ------------------------------------------------------------------ */
-/* Setpoint / enable handling                                           */
-/* ------------------------------------------------------------------ */
-static void settings_touch(void)
-{
-    g_settings_dirty = true;
-    g_settings_dirty_at = millis();
-}
-
-static void set_target(float t)
-{
-    if (t < SETPOINT_MIN_C) t = SETPOINT_MIN_C;
-    if (t > SETPOINT_MAX_C) t = SETPOINT_MAX_C;
-    if (t != g_target) {
-        g_target = t;
-        verify_reset();
-        settings_touch();
-    }
-}
-
-static void set_enabled(bool en)
-{
-    if (en == g_enabled) return;
-    g_enabled = en;
-    control_reset();
-    verify_reset();
-    set_heater_power(0.0f);
-    settings_touch();
-}
-
-static void settings_flush_if_due(uint32_t now)
-{
-    if (g_settings_dirty && (now - g_settings_dirty_at) >= SETTINGS_SAVE_DELAY_MS) {
-        settings_t s = { .setpoint_c10 = (int16_t)(g_target * 10.0f + 0.5f),
-                         .enabled = g_enabled ? 1 : 0 };
-        settings_save(&s);
-        g_settings_dirty = false;
-    }
-}
-
-/* ------------------------------------------------------------------ */
 /* USB telemetry / commands                                            */
 /* ------------------------------------------------------------------ */
 static void handle_usb_commands(void)
@@ -241,9 +149,6 @@ static void handle_usb_commands(void)
     switch (c) {
     case 'b': case 'B': usb_request_bootloader(); break;
     case 'r': case 'R': NVIC_SystemReset(); break;
-    case '+': case '=': set_target(g_target + SETPOINT_STEP_C); break;
-    case '-': case '_': set_target(g_target - SETPOINT_STEP_C); break;
-    case 'e': case 'E': set_enabled(!g_enabled); break;
     default: break;
     }
 }
@@ -257,7 +162,7 @@ static void telemetry(void)
              "t=%lus temp=%d.%02dC raw=%d duty=%u%% target=%d.%d en=%d oled=%d state=%s\r\n",
              (unsigned long)(millis() / 1000u), t100 / 100, (t100 < 0 ? -t100 : t100) % 100,
              (int)(g_adc_raw + 0.5f), (unsigned)g_heater_duty,
-             s10 / 10, s10 % 10, g_enabled ? 1 : 0, oled_present() ? 1 : 0, g_state);
+             s10 / 10, s10 % 10, 1, oled_present() ? 1 : 0, g_state);
     usb_write(line);
 }
 
@@ -274,7 +179,7 @@ static void fault(const char *reason, const char *short_text)
     led_pattern_fault();
     /* Latch forever, keep the watchdog happy so we don't reboot into a
      * heating state. Keep USB + display alive so the fault can be read.  */
-    uint32_t last = millis(), last_ui = millis(), last_btn = millis();
+    uint32_t last = millis(), last_ui = millis();
     for (;;) {
         IWDG->KR = 0xAAAAu;
         HEATER_OFF();
@@ -282,12 +187,6 @@ static void fault(const char *reason, const char *short_text)
         handle_usb_commands();
         oled_poll(millis());
         uint32_t now = millis();
-        if ((now - last_btn) >= SAMPLE_PERIOD_MS) {
-            last_btn = now;
-            if (btn_update(&btn_ok, now) == BTN_CLICK) NVIC_SystemReset();
-            btn_update(&btn_up, now);
-            btn_update(&btn_down, now);
-        }
         if ((now - last) >= 1000u) {
             last = now;
             g_adc_raw = adc_read_avg();
@@ -342,12 +241,6 @@ static void gpio_init(void)
     GPIOA->OTYPER  &= ~(1u << LED_PIN);
     GPIOA->MODER    = (GPIOA->MODER & ~(3u << (LED_PIN * 2)))
                     | (1u << (LED_PIN * 2));
-
-    /* Buttons PB5/PB6/PB7: inputs with pull-up (board also has 10k)   */
-    uint32_t mask2 = (3u << (BTN_UP_PIN * 2)) | (3u << (BTN_DOWN_PIN * 2)) | (3u << (BTN_OK_PIN * 2));
-    uint32_t pu    = (1u << (BTN_UP_PIN * 2)) | (1u << (BTN_DOWN_PIN * 2)) | (1u << (BTN_OK_PIN * 2));
-    GPIOB->MODER &= ~mask2;
-    GPIOB->PUPDR  = (GPIOB->PUPDR & ~mask2) | pu;
 }
 
 static void adc_init(void)
@@ -444,8 +337,6 @@ static float adc_to_temp(float adc)
 static float pid_prev_temp, pid_prev_integ;
 static bool  pid_first = true;
 
-static void control_reset(void) { pid_first = true; pid_prev_integ = 0.0f; }
-
 static float control_update(float temp, float dt)
 {
     if (pid_first) { pid_prev_temp = temp; pid_first = false; }
@@ -468,8 +359,6 @@ static float control_update(float temp, float dt)
 }
 #else
 static bool bb_heating;
-static void control_reset(void) { bb_heating = false; }
-
 static float control_update(float temp, float dt)
 {
     (void)dt;
@@ -491,13 +380,6 @@ static float control_update(float temp, float dt)
 static bool     vh_approaching, vh_starting;
 static float    vh_goal_temp, vh_error, vh_last_target = -1000.0f;
 static uint32_t vh_goal_time;
-
-static void verify_reset(void)
-{
-    vh_approaching = vh_starting = false;
-    vh_error = 0.0f;
-    vh_last_target = -1000.0f;              /* forces a fresh approach check */
-}
 
 static void verify_heater(float temp, uint32_t now, float dt)
 {
@@ -563,7 +445,7 @@ static void ui_update(void)
         .temp        = g_temp,
         .target      = g_target,
         .power_pct   = ((unsigned)g_heater_duty * 100u) / PWM_WINDOW_MS,
-        .enabled     = g_enabled,
+        .enabled     = true,
         .at_temp     = g_temp >= g_target - VERIFY_HYST_C,
         .fault       = g_fault_latched,
         .fault_short = g_fault_short,
@@ -583,14 +465,6 @@ int main(void)
     usb_init();
     oled_init();
     iwdg_init();
-
-    settings_t saved;
-    if (settings_load(&saved)) {
-        g_target  = (float)saved.setpoint_c10 / 10.0f;
-        if (g_target < SETPOINT_MIN_C) g_target = SETPOINT_MIN_C;
-        if (g_target > SETPOINT_MAX_C) g_target = SETPOINT_MAX_C;
-        g_enabled = saved.enabled != 0;
-    }
 
     /* Let the ADC filter settle before trusting readings              */
     float temp_filt = adc_to_temp(adc_read_avg());
@@ -622,31 +496,20 @@ int main(void)
             temp_filt += 0.25f * (adc_to_temp(g_adc_raw) - temp_filt);
             g_temp = temp_filt;
             check_limits(temp_filt);
-
-            int e;
-            if ((e = btn_update(&btn_up, now)) != BTN_NONE)   set_target(g_target + SETPOINT_STEP_C);
-            if ((e = btn_update(&btn_down, now)) != BTN_NONE) set_target(g_target - SETPOINT_STEP_C);
-            if (btn_update(&btn_ok, now) == BTN_CLICK)        set_enabled(!g_enabled);
         }
 
         if ((now - last_control) >= CONTROL_PERIOD_MS) {
             float dt = (float)(now - last_control) / 1000.0f;
             last_control = now;
             g_control_stamp = now;              /* keeps SysTick's heater gate open */
-            if (g_enabled) {
-                set_heater_power(control_update(temp_filt, dt));
-                verify_heater(temp_filt, now, dt);
-                if (temp_filt >= g_target - VERIFY_HYST_C) {
-                    g_state = "AT_TEMP";
-                    led_pattern_at_temp();
-                } else {
-                    g_state = "HEATING";
-                    led_pattern_heating();
-                }
+            set_heater_power(control_update(temp_filt, dt));
+            verify_heater(temp_filt, now, dt);
+            if (temp_filt >= g_target - VERIFY_HYST_C) {
+                g_state = "AT_TEMP";
+                led_pattern_at_temp();
             } else {
-                set_heater_power(0.0f);
-                g_state = "STANDBY";
-                led_pattern_standby();
+                g_state = "HEATING";
+                led_pattern_heating();
             }
         }
 
@@ -660,7 +523,6 @@ int main(void)
             telemetry();
         }
 
-        settings_flush_if_due(now);
         oled_poll(now);
         usb_task();
         handle_usb_commands();

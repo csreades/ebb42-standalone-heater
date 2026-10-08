@@ -17,7 +17,7 @@ LDFLAGS  := $(MCUFLAGS) -specs=nano.specs -specs=nosys.specs \
             -Wl,-Map=$(BUILD)/$(TARGET).map -Wl,--print-memory-usage
 LDLIBS   := -lm
 
-SRCS_C := src/main.c src/usb.c src/usb_descriptors.c src/oled.c src/ui.c src/settings.c \
+SRCS_C := src/main.c src/usb.c src/usb_descriptors.c src/oled.c src/ui.c \
           $(TUSB)/tusb.c \
           $(TUSB)/common/tusb_fifo.c \
           $(TUSB)/device/usbd.c \

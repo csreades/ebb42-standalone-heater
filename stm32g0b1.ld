@@ -3,7 +3,7 @@ ENTRY(Reset_Handler)
 
 MEMORY
 {
-  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 126K   /* last 2K page = settings */
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 126K   /* last 2K page left unused */
   RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 144K
 }
 
