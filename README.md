@@ -2,7 +2,7 @@
 
 Bare-metal firmware that turns a BIGTREETECH EBB42 CAN v1.2 toolhead board
 into a self-contained temperature controller: it holds the thermistor at a
-fixed 80 °C with no host, no CAN, and no USB needed after
+fixed 90 °C with no host, no CAN, and no USB needed after
 flashing. The setpoint is hard-coded and the heater is always enabled:
 there are no buttons, no setpoint commands, and nothing is stored in flash.
 To change the temperature, edit `TARGET_C` in `src/main.c` and reflash.

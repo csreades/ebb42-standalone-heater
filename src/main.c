@@ -34,7 +34,7 @@
 /* ------------------------------------------------------------------ */
 /* User configuration                                                  */
 /* ------------------------------------------------------------------ */
-#define TARGET_C             80.0f
+#define TARGET_C             90.0f
 #define CONTROL_MODE_PID     1        /* 1 = PID, 0 = bang-bang            */
 #define MAX_POWER            1.0f     /* 0.0 .. 1.0 cap on heater duty     */
 #define BANGBANG_HYST_C      1.0f
