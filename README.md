@@ -6,6 +6,9 @@ fixed 65 °C with no host, no CAN, and no USB needed after
 flashing. The setpoint is hard-coded and the heater is always enabled:
 there are no buttons, no setpoint commands, and nothing is stored in flash.
 To change the temperature, edit `TARGET_C` in `src/main.c` and reflash.
+For a one-off board with a different setpoint, build a separate image
+without editing the source: `make SETPOINT=70 BUILD=build-70`, then flash
+`build-70/ebb42_heater.bin` with `dfu-util` (as in `flash.sh`).
 
 ## Hardware assumptions
 

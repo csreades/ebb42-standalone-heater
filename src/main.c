@@ -35,7 +35,9 @@
 /* ------------------------------------------------------------------ */
 /* User configuration                                                  */
 /* ------------------------------------------------------------------ */
+#ifndef TARGET_C                      /* override: make SETPOINT=70 */
 #define TARGET_C             65.0f
+#endif
 #define RAMP_TIME_MS         180000u  /* at power-up the setpoint rises in a straight
                                          line from the starting temperature to
                                          TARGET_C over this time (0 = no ramp)   */

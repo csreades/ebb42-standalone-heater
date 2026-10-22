@@ -11,6 +11,10 @@ CFLAGS   := $(MCUFLAGS) -std=gnu11 -O2 -g3 -Wall -Wextra -Wno-unused-parameter \
             -ffunction-sections -fdata-sections -fno-common \
             -DSTM32G0B1xx -DCFG_TUSB_MCU=OPT_MCU_STM32G0 -DCFG_TUSB_OS=OPT_OS_NONE \
             -Isrc -Ivendor/cmsis_device_g0/Include -Ivendor/cmsis_core -I$(TUSB)
+# Per-board setpoint override, e.g. `make SETPOINT=70 BUILD=build-70`
+ifdef SETPOINT
+CFLAGS   += -DTARGET_C=$(SETPOINT).0f
+endif
 ASFLAGS  := $(MCUFLAGS) -x assembler-with-cpp
 LDFLAGS  := $(MCUFLAGS) -specs=nano.specs -specs=nosys.specs \
             -Wl,-T,stm32g0b1.ld -Wl,--gc-sections \
