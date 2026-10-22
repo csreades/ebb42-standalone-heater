@@ -10,7 +10,8 @@
  *         PA13 is also SWDIO; using it as a GPIO disables SWD (DFU still works).
  *         Slow blink = heating, solid = at temperature, fast blink = fault.
  * OLED  : optional 128x64 SSD1306 on the I2C header (PB3 SCL, PB4 SDA).
- * Setpoint is fixed at TARGET_C and the heater is always enabled; there
+ * Setpoint is fixed at TARGET_C (reached via a RAMP_TIME_MS soft start at
+ * power-up) and the heater is always enabled; there
  * are no buttons and nothing is stored in flash. Change TARGET_C and reflash.
  * USB   : CDC serial telemetry once a second. Commands: 'r' reset (clears a
  *         latched fault), 'b' reboot to DFU bootloader.
@@ -34,7 +35,10 @@
 /* ------------------------------------------------------------------ */
 /* User configuration                                                  */
 /* ------------------------------------------------------------------ */
-#define TARGET_C             90.0f
+#define TARGET_C             65.0f
+#define RAMP_TIME_MS         180000u  /* at power-up the setpoint rises in a straight
+                                         line from the starting temperature to
+                                         TARGET_C over this time (0 = no ramp)   */
 #define CONTROL_MODE_PID     1        /* 1 = PID, 0 = bang-bang            */
 #define MAX_POWER            1.0f     /* 0.0 .. 1.0 cap on heater duty     */
 #define BANGBANG_HYST_C      1.0f
@@ -84,7 +88,8 @@ static volatile uint8_t  g_heater_duty;     /* 0..PWM_WINDOW_MS            */
 static volatile bool     g_fault_latched;
 static volatile uint32_t g_control_stamp;   /* millis() of last control update */
 
-static const float g_target = TARGET_C;
+static float       g_target = TARGET_C;    /* current (ramped) setpoint   */
+static bool        g_ramping;
 static float       g_temp;                  /* filtered temperature        */
 static float       g_adc_raw;
 static const char *g_state = "STARTUP";
@@ -427,12 +432,21 @@ static void check_adc_range(float raw)
     }
 }
 
+/* Overshoot reference: normally the setpoint. If the board starts (or is
+ * reset) hotter than the setpoint, it starts at that temperature and then
+ * follows the temperature down as it cools, so a hot restart after lowering
+ * TARGET_C doesn't trip FAULT_OVERSHOOT, but a later rise of OVERSHOOT_FAULT_C
+ * above the lowest point it cooled to still does.                       */
+static float g_overshoot_ref = -1000.0f;
+
 static void check_limits(float temp)
 {
+    if (temp < g_overshoot_ref) g_overshoot_ref = temp;
+    if (g_overshoot_ref < g_target) g_overshoot_ref = g_target;
     if (!isfinite(temp))                        fault("FAULT_SENSOR_NAN", "SENSOR ERROR");
     if (temp < MIN_TEMP_C)                      fault("FAULT_SENSOR_OPEN_OR_TOO_COLD", "SENSOR OPEN");
     if (temp > MAX_TEMP_C)                      fault("FAULT_SENSOR_SHORT_OR_TOO_HOT", "SENSOR SHORT");
-    if (temp > g_target + OVERSHOOT_FAULT_C)    fault("FAULT_OVERSHOOT", "OVERSHOOT");
+    if (temp > g_overshoot_ref + OVERSHOOT_FAULT_C) fault("FAULT_OVERSHOOT", "OVERSHOOT");
 }
 
 /* ------------------------------------------------------------------ */
@@ -454,6 +468,33 @@ static void ui_update(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Power-up setpoint ramp                                               */
+/* ------------------------------------------------------------------ */
+static float    ramp_start_c;
+static uint32_t ramp_start_ms;
+
+static void ramp_begin(float temp, uint32_t now)
+{
+    ramp_start_c  = temp;
+    ramp_start_ms = now;
+    g_ramping     = RAMP_TIME_MS > 0u && temp < TARGET_C;
+    g_target      = g_ramping ? temp : TARGET_C;
+}
+
+static void ramp_update(uint32_t now)
+{
+    if (!g_ramping) return;
+    uint32_t elapsed = now - ramp_start_ms;
+    if (elapsed >= RAMP_TIME_MS) {
+        g_target  = TARGET_C;
+        g_ramping = false;
+        return;
+    }
+    g_target = ramp_start_c +
+               (TARGET_C - ramp_start_c) * ((float)elapsed / (float)RAMP_TIME_MS);
+}
+
+/* ------------------------------------------------------------------ */
 int main(void)
 {
     gpio_init();
@@ -468,6 +509,7 @@ int main(void)
 
     /* Let the ADC filter settle before trusting readings              */
     float temp_filt = adc_to_temp(adc_read_avg());
+    g_overshoot_ref = MAX_TEMP_C;   /* tightened from the first check_limits() */
     uint32_t t0 = millis();
     while ((millis() - t0) < STARTUP_SETTLE_MS) {
         g_adc_raw = adc_read_avg();
@@ -479,6 +521,7 @@ int main(void)
         delay_ms(SAMPLE_PERIOD_MS);
     }
     check_limits(temp_filt);
+    ramp_begin(temp_filt, millis());
 
     uint32_t last_sample  = millis();
     uint32_t last_control = millis();
@@ -502,9 +545,13 @@ int main(void)
             float dt = (float)(now - last_control) / 1000.0f;
             last_control = now;
             g_control_stamp = now;              /* keeps SysTick's heater gate open */
+            ramp_update(now);
             set_heater_power(control_update(temp_filt, dt));
             verify_heater(temp_filt, now, dt);
-            if (temp_filt >= g_target - VERIFY_HYST_C) {
+            if (g_ramping) {
+                g_state = "RAMPING";
+                led_pattern_heating();
+            } else if (temp_filt >= g_target - VERIFY_HYST_C) {
                 g_state = "AT_TEMP";
                 led_pattern_at_temp();
             } else {

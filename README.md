@@ -2,7 +2,7 @@
 
 Bare-metal firmware that turns a BIGTREETECH EBB42 CAN v1.2 toolhead board
 into a self-contained temperature controller: it holds the thermistor at a
-fixed 90 °C with no host, no CAN, and no USB needed after
+fixed 65 °C with no host, no CAN, and no USB needed after
 flashing. The setpoint is hard-coded and the heater is always enabled:
 there are no buttons, no setpoint commands, and nothing is stored in flash.
 To change the temperature, edit `TARGET_C` in `src/main.c` and reflash.
@@ -27,6 +27,11 @@ To change the temperature, edit `TARGET_C` in `src/main.c` and reflash.
 * PID control (Klipper-style gains, output on 0..255 scale), 250 ms loop,
   100 ms time-proportioning window on the heater pin.
   Set `CONTROL_MODE_PID 0` for simple bang-bang with ±1 °C hysteresis.
+* Soft start: at power-up (or after a reset) the setpoint starts at the
+  measured temperature and rises in a straight line to `TARGET_C` over
+  `RAMP_TIME_MS` (3 minutes), e.g. 30 -> 65 °C climbs about 0.19 °C/s.
+  The safety checks below follow the ramped setpoint. Set `RAMP_TIME_MS 0`
+  to heat at full rate.
 * Safety: the same checks Klipper applies to a toolhead heater, all of which
   latch the heater **off until reset / power cycle** (see table below).
 * Heater is held low from the first instruction and stays off for 1 s at
@@ -41,7 +46,7 @@ To change the temperature, edit `TARGET_C` in `src/main.c` and reflash.
 | `verify_heater` heating gain           | must rise `VERIFY_GAIN_C` (1.5 °C) every `VERIFY_TIME_MS` (45 s)      |
 | `verify_heater` `max_error`            | 120 °C·s below target-5 °C while at temp -> `FAULT_HEATER_NOT_MAINTAINING_TEMP` |
 | `verify_heater` `hysteresis`           | 5 °C                                                                 |
-| overshoot                              | target + 25 °C -> fault (Klipper relies on `max_temp` for this)      |
+| overshoot                              | target + 25 °C -> fault (Klipper relies on `max_temp` for this). If it starts hotter than target, the limit is 25 °C above the lowest temperature it has cooled to |
 | heater `max_duration` (MCU turns PWM off if host stops refreshing) | SysTick forces the pin low if the control loop has not run for 1 s |
 | MCU watchdog                           | independent watchdog, 2 s                                            |
 | heater off at boot / on shutdown       | pin driven low before it becomes an output; gate has a 20k pull-down; PWM window only opens after the first control update |
@@ -61,7 +66,8 @@ line per second:
 t=21s temp=20.66C raw=3942 duty=100% target=80.0 en=1 oled=0 state=HEATING
 ```
 
-`state` is `STARTUP`, `HEATING`, `AT_TEMP` or a `FAULT_*` reason.
+`state` is `STARTUP`, `RAMPING` (soft start in progress; `target` shows the
+ramped setpoint), `HEATING`, `AT_TEMP` or a `FAULT_*` reason.
 Run `./monitor.sh` to watch it. Single-character commands:
 
 | Key | Action                                              |
